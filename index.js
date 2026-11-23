@@ -168,7 +168,6 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
 });
 
-// ================= واجهات لوحة التحكم (API) =================
 app.get('/api/status', (req, res) => {
     res.json({
         botReady,
@@ -210,7 +209,6 @@ app.post('/api/reconnect', async (req, res) => {
     res.json({ ok: true, config });
 });
 
-// ================= صفحة لوحة التحكم =================
 app.get('/', (req, res) => {
     res.type('html').send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
