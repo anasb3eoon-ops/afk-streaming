@@ -860,7 +860,7 @@ class SessionController:
                 channel_id=channel_id,
                 role="viewer",
                 self_mute=True,
-                self_deaf=True,
+                self_deaf=False,
             )
             self.tasks.append(asyncio.create_task(self.viewer.run_forever()))
 
