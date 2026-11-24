@@ -44,9 +44,15 @@ function saveConfig(newCfg) {
 
 let config = saveConfig(loadConfig());
 const logs = [];
-let botReady = false;
-let botUserTag = 'غير متصل';
+
+let mainReady = false;
+let mainUserTag = 'غير متصل';
 let streamActive = false;
+
+const hasWatcherToken = Boolean((process.env.WATCHER_TOKEN || '').trim());
+let watcherReady = false;
+let watcherUserTag = hasWatcherToken ? 'جاري الاتصال...' : 'غير مفعّل';
+let watcherWatching = false;
 
 function addLog(message) {
     const time = new Date().toLocaleTimeString('ar-EG', { hour12: false });
@@ -60,31 +66,103 @@ const client = new Client({
     checkUpdate: false
 });
 
-function destroyCurrentVoice(reason = '') {
-    if (config.guildId) {
-        const existing = getVoiceConnection(config.guildId);
-        if (existing) {
-            existing.destroy();
-        }
+const watcherClient = hasWatcherToken
+    ? new Client({ checkUpdate: false })
+    : null;
+
+function destroyVoiceForClient(targetClient, targetGuildId) {
+    if (!targetClient) return;
+    if (targetGuildId) {
+        const existing = getVoiceConnection(targetGuildId, targetClient.user?.id);
+        if (existing) existing.destroy();
     }
-    if (client.guilds && client.guilds.cache) {
-        client.guilds.cache.forEach((g) => {
-            const conn = getVoiceConnection(g.id);
+    if (targetClient.guilds && targetClient.guilds.cache) {
+        targetClient.guilds.cache.forEach((g) => {
+            const conn = getVoiceConnection(g.id, targetClient.user?.id);
             if (conn) conn.destroy();
         });
     }
+}
+
+function destroyAllVoice(reason = '') {
+    destroyVoiceForClient(client, config.guildId);
+    if (watcherClient) {
+        destroyVoiceForClient(watcherClient, config.guildId);
+    }
     streamActive = false;
+    watcherWatching = false;
     if (reason) addLog(reason);
 }
 
+async function connectWatcher(guild, channel) {
+    if (!watcherClient || !watcherReady || !client.user) {
+        watcherWatching = false;
+        return;
+    }
+
+    const wGuild = watcherClient.guilds.cache.get(guild.id);
+    if (!wGuild) {
+        watcherWatching = false;
+        addLog(`⚠️ حساب المشاهد غير موجود في السيرفر (${guild.id}).`);
+        return;
+    }
+
+    const wChannel = wGuild.channels.cache.get(channel.id);
+    if (!wChannel || (wChannel.type !== 'GUILD_VOICE' && wChannel.type !== 'GUILD_STAGE_VOICE')) {
+        watcherWatching = false;
+        addLog(`⚠️ حساب المشاهد لا يمكنه الوصول للروم الصوتي (${channel.id}).`);
+        return;
+    }
+
+    try {
+        destroyVoiceForClient(watcherClient, guild.id);
+
+        joinVoiceChannel({
+            channelId: wChannel.id,
+            guildId: wGuild.id,
+            adapterCreator: wGuild.voiceAdapterCreator,
+            selfMute: true,
+            selfDeaf: true,
+            group: watcherClient.user.id
+        });
+
+        addLog(`👀 دخل حساب المشاهد (${watcherUserTag}) إلى الروم: ${wChannel.name}`);
+
+        setTimeout(() => {
+            if (!config.enabled || !watcherReady || !client.user) return;
+            try {
+                const streamKey = `stream:${guild.id}:${channel.id}:${client.user.id}`;
+                watcherClient.ws.broadcast({
+                    op: 18,
+                    d: {
+                        type: 4,
+                        guild_id: guild.id,
+                        channel_id: channel.id,
+                        stream_key: streamKey,
+                        preferred_region: null
+                    }
+                });
+                watcherWatching = true;
+                addLog(`📡 أرسل حساب المشاهد إشارة متابعة البث (${streamKey})`);
+            } catch (err) {
+                watcherWatching = false;
+                addLog(`⚠️ تعذر إرسال إشارة المشاهدة: ${err.message}`);
+            }
+        }, 3500);
+    } catch (err) {
+        watcherWatching = false;
+        addLog(`⚠️ خطأ في دخول حساب المشاهد: ${err.message}`);
+    }
+}
+
 async function applyVoiceState() {
-    if (!botReady) {
-        addLog('⏳ الحساب لم يكتمل تسجيل دخوله بعد...');
+    if (!mainReady) {
+        addLog('⏳ الحساب الأساسي لم يكتمل تسجيل دخوله بعد...');
         return;
     }
 
     if (!config.enabled) {
-        destroyCurrentVoice('🛑 تم إيقاف السكربت والخروج من الروم الصوتي.');
+        destroyAllVoice('🛑 تم إيقاف السكربت والخروج من الروم الصوتي.');
         return;
     }
 
@@ -108,20 +186,21 @@ async function applyVoiceState() {
     }
 
     try {
-        destroyCurrentVoice();
+        destroyAllVoice();
 
         joinVoiceChannel({
             channelId: channel.id,
             guildId: guild.id,
             adapterCreator: guild.voiceAdapterCreator,
             selfMute: config.selfMute,
-            selfDeaf: config.selfDeaf
+            selfDeaf: config.selfDeaf,
+            group: client.user.id
         });
 
         addLog(`✅ تم الدخول إلى الروم: ${channel.name} (${guild.name})`);
 
         setTimeout(() => {
-            if (!config.enabled || !botReady) return;
+            if (!config.enabled || !mainReady) return;
             try {
                 client.ws.broadcast({
                     op: 18,
@@ -133,11 +212,17 @@ async function applyVoiceState() {
                     }
                 });
                 streamActive = true;
-                addLog(`🖥️ تم تفعيل السكرين شير (Go Live) في الروم: ${channel.name}`);
+                addLog(`🖥️ تم إرسال إشارة البث (Go Live) في الروم: ${channel.name}`);
             } catch (wsErr) {
                 addLog(`⚠️ تعذر إرسال حزمة Go Live: ${wsErr.message}`);
             }
         }, 2500);
+
+        if (watcherClient && watcherReady) {
+            setTimeout(() => {
+                if (config.enabled) connectWatcher(guild, channel);
+            }, 4000);
+        }
     } catch (err) {
         streamActive = false;
         addLog(`⚠️ خطأ أثناء الاتصال بالروم: ${err.message}`);
@@ -145,9 +230,9 @@ async function applyVoiceState() {
 }
 
 client.on('ready', () => {
-    botReady = true;
-    botUserTag = client.user ? client.user.tag : 'متصل';
-    addLog(`🚀 تم تسجيل الدخول باسم: ${botUserTag}`);
+    mainReady = true;
+    mainUserTag = client.user ? client.user.tag : 'متصل';
+    addLog(`🚀 تم تسجيل دخول الحساب الأساسي: ${mainUserTag}`);
     applyVoiceState();
 });
 
@@ -156,23 +241,54 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
     if (config.enabled && oldState.channelId && !newState.channelId) {
         streamActive = false;
-        addLog('🔄 تم فصل الحساب من الروم، جاري إعادة الدخول خلال 5 ثوانٍ...');
+        addLog('🔄 تم فصل الحساب الأساسي من الروم، جاري إعادة الدخول خلال 5 ثوانٍ...');
         setTimeout(() => {
             if (config.enabled) applyVoiceState();
         }, 5000);
     } else if (config.enabled && newState.channelId && newState.channelId !== config.channelId) {
-        addLog(`🔀 تم نقل الحساب إلى روم آخر (${newState.channelId})، جاري إعادته للروم المحدد...`);
+        addLog(`🔀 تم نقل الحساب الأساسي إلى روم آخر (${newState.channelId})، جاري إعادته...`);
         setTimeout(() => {
             if (config.enabled) applyVoiceState();
         }, 2000);
     }
 });
 
+if (watcherClient) {
+    watcherClient.on('ready', () => {
+        watcherReady = true;
+        watcherUserTag = watcherClient.user ? watcherClient.user.tag : 'مشاهد متصل';
+        addLog(`👁️ تم تسجيل دخول حساب المشاهد: ${watcherUserTag}`);
+        if (config.enabled && mainReady) {
+            applyVoiceState();
+        }
+    });
+
+    watcherClient.on('voiceStateUpdate', (oldState, newState) => {
+        if (!watcherClient.user || oldState.member?.id !== watcherClient.user.id) return;
+        if (config.enabled && oldState.channelId && !newState.channelId) {
+            watcherWatching = false;
+            addLog('🔄 تم فصل حساب المشاهد من الروم، جاري إعادة دخوله خلال 5 ثوانٍ...');
+            setTimeout(() => {
+                const guild = client.guilds.cache.get(config.guildId);
+                const channel = guild?.channels.cache.get(config.channelId);
+                if (config.enabled && guild && channel) {
+                    connectWatcher(guild, channel);
+                }
+            }, 5000);
+        }
+    });
+}
+
+// ================= واجهات لوحة التحكم (API) =================
 app.get('/api/status', (req, res) => {
     res.json({
-        botReady,
-        botUserTag,
+        botReady: mainReady,
+        botUserTag: mainUserTag,
         streamActive,
+        hasWatcherToken,
+        watcherReady,
+        watcherUserTag,
+        watcherWatching,
         config,
         logs
     });
@@ -186,8 +302,7 @@ app.post('/api/config', async (req, res) => {
     });
 
     if (previousGuildId && previousGuildId !== config.guildId) {
-        const oldConn = getVoiceConnection(previousGuildId);
-        if (oldConn) oldConn.destroy();
+        destroyAllVoice();
     }
 
     addLog('💾 تم تحديث إعدادات التحكم من اللوحة.');
@@ -209,6 +324,7 @@ app.post('/api/reconnect', async (req, res) => {
     res.json({ ok: true, config });
 });
 
+// ================= صفحة لوحة التحكم =================
 app.get('/', (req, res) => {
     res.type('html').send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -219,7 +335,7 @@ app.get('/', (req, res) => {
 <style>
   * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
   body { margin: 0; background: #0f172a; color: #e2e8f0; padding: 20px; }
-  .wrap { max-width: 760px; margin: 0 auto; }
+  .wrap { max-width: 780px; margin: 0 auto; }
   .card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 20px; margin-bottom: 16px; }
   h1 { margin: 0 0 6px; font-size: 20px; }
   .sub { color: #94a3b8; font-size: 13px; margin-bottom: 16px; }
@@ -247,13 +363,14 @@ app.get('/', (req, res) => {
 <body>
 <div class="wrap">
   <div class="card">
-    <h1>لوحة تحكم الروم والبث (AFK + Go Live)</h1>
-    <div class="sub">تغيير الروم أو السيرفر، تشغيل أو إيقاف السكربت، وتحديث حالة الصوت مباشرة</div>
+    <h1>لوحة تحكم الروم والبث (AFK + Go Live + Watcher)</h1>
+    <div class="sub">تغيير الروم أو السيرفر، تشغيل أو إيقاف السكربت، ومراقبة حساب المشاهد الاختياري</div>
 
     <div class="status-bar">
       <div id="botBadge" class="badge">الحساب: ...</div>
       <div id="runBadge" class="badge">السكربت: ...</div>
       <div id="streamBadge" class="badge">البث: ...</div>
+      <div id="watcherBadge" class="badge">المشاهد: ...</div>
     </div>
 
     <div class="grid">
@@ -311,6 +428,18 @@ async function refreshStatus(forceInputs = false) {
     const streamBadge = document.getElementById('streamBadge');
     streamBadge.textContent = 'البث: ' + (data.streamActive ? 'LIVE نشط' : 'غير نشط');
     streamBadge.className = 'badge ' + (data.streamActive ? 'ok' : '');
+
+    const watcherBadge = document.getElementById('watcherBadge');
+    if (!data.hasWatcherToken) {
+      watcherBadge.textContent = 'المشاهد: غير مفعّل';
+      watcherBadge.className = 'badge';
+    } else if (data.watcherReady) {
+      watcherBadge.textContent = 'المشاهد: ' + data.watcherUserTag + (data.watcherWatching ? ' (متابع)' : '');
+      watcherBadge.className = 'badge ok';
+    } else {
+      watcherBadge.textContent = 'المشاهد: جاري الاتصال...';
+      watcherBadge.className = 'badge off';
+    }
 
     const toggleBtn = document.getElementById('toggleBtn');
     toggleBtn.textContent = currentEnabled ? 'إيقاف السكربت' : 'تشغيل السكربت';
@@ -393,6 +522,15 @@ if (!token) {
     addLog('❌ متغير DISCORD_TOKEN غير موجود! أضفه في Environment Variables على الاستضافة.');
 } else {
     client.login(token).catch((err) => {
-        addLog(`❌ فشل تسجيل الدخول: ${err.message}`);
+        addLog(`❌ فشل تسجيل الدخول للحساب الأساسي: ${err.message}`);
+    });
+}
+
+const watcherToken = (process.env.WATCHER_TOKEN || '').trim();
+if (watcherClient && watcherToken) {
+    watcherClient.login(watcherToken).catch((err) => {
+        watcherReady = false;
+        watcherUserTag = 'خطأ دخول';
+        addLog(`❌ فشل تسجيل دخول حساب المشاهد: ${err.message}`);
     });
 }
