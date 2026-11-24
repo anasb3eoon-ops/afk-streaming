@@ -52,13 +52,15 @@ let streamActive = false;
 const hasWatcherToken = Boolean((process.env.WATCHER_TOKEN || '').trim());
 let watcherReady = false;
 let watcherUserTag = hasWatcherToken ? 'جاري الاتصال...' : 'غير مفعّل';
+let watcherInChannel = false;
 let watcherWatching = false;
+let watcherVerifyTimer = null;
 
 function addLog(message) {
     const time = new Date().toLocaleTimeString('ar-EG', { hour12: false });
     const entry = `[${time}] ${message}`;
     logs.unshift(entry);
-    if (logs.length > 60) logs.pop();
+    if (logs.length > 80) logs.pop();
     console.log(entry);
 }
 
@@ -70,11 +72,26 @@ const watcherClient = hasWatcherToken
     ? new Client({ checkUpdate: false })
     : null;
 
+function sendRawVoiceState(targetClient, guildId, channelId, selfMute = true, selfDeaf = true) {
+    if (!targetClient || !targetClient.ws) return;
+    targetClient.ws.broadcast({
+        op: 4,
+        d: {
+            guild_id: guildId,
+            channel_id: channelId,
+            self_mute: Boolean(selfMute),
+            self_deaf: Boolean(selfDeaf),
+            self_video: false
+        }
+    });
+}
+
 function destroyVoiceForClient(targetClient, targetGuildId) {
     if (!targetClient) return;
     if (targetGuildId) {
         const existing = getVoiceConnection(targetGuildId, targetClient.user?.id);
         if (existing) existing.destroy();
+        sendRawVoiceState(targetClient, targetGuildId, null, true, true);
     }
     if (targetClient.guilds && targetClient.guilds.cache) {
         targetClient.guilds.cache.forEach((g) => {
@@ -85,23 +102,85 @@ function destroyVoiceForClient(targetClient, targetGuildId) {
 }
 
 function destroyAllVoice(reason = '') {
+    if (watcherVerifyTimer) {
+        clearTimeout(watcherVerifyTimer);
+        watcherVerifyTimer = null;
+    }
     destroyVoiceForClient(client, config.guildId);
     if (watcherClient) {
         destroyVoiceForClient(watcherClient, config.guildId);
     }
     streamActive = false;
+    watcherInChannel = false;
     watcherWatching = false;
     if (reason) addLog(reason);
 }
 
+function checkWatcherPresence(guildId, channelId) {
+    if (!watcherClient || !watcherReady || !watcherClient.user) return false;
+    const wGuild = watcherClient.guilds.cache.get(guildId);
+    if (!wGuild) return false;
+
+    const wChannel = wGuild.channels.cache.get(channelId);
+    const voiceState = wGuild.voiceStates?.cache?.get(watcherClient.user.id);
+    const inMembers = Boolean(wChannel && wChannel.members && wChannel.members.has(watcherClient.user.id));
+    const inVoiceState = Boolean(voiceState && voiceState.channelId === channelId);
+
+    return inMembers || inVoiceState;
+}
+
+function verifyWatcherInChannel(guild, channel, attempt = 1) {
+    if (!config.enabled || !watcherClient || !watcherReady || !client.user) return;
+
+    const present = checkWatcherPresence(guild.id, channel.id);
+    if (present) {
+        watcherInChannel = true;
+        addLog(`✅ تم التحقق: حساب المشاهد (${watcherUserTag}) موجود فعلياً داخل الروم: ${channel.name}`);
+
+        try {
+            const streamKey = `stream:${guild.id}:${channel.id}:${client.user.id}`;
+            watcherClient.ws.broadcast({
+                op: 18,
+                d: {
+                    type: 4,
+                    guild_id: guild.id,
+                    channel_id: channel.id,
+                    stream_key: streamKey,
+                    preferred_region: null
+                }
+            });
+            watcherWatching = true;
+            addLog(`📡 أرسل حساب المشاهد إشارة متابعة البث (${streamKey})`);
+        } catch (err) {
+            watcherWatching = false;
+            addLog(`⚠️ تعذر إرسال إشارة المشاهدة: ${err.message}`);
+        }
+        return;
+    }
+
+    watcherInChannel = false;
+    watcherWatching = false;
+
+    if (attempt < 4) {
+        sendRawVoiceState(watcherClient, guild.id, channel.id, true, true);
+        watcherVerifyTimer = setTimeout(() => {
+            verifyWatcherInChannel(guild, channel, attempt + 1);
+        }, 2000);
+    } else {
+        addLog(`❌ تنبيه: حساب المشاهد (${watcherUserTag}) لم يظهر فعلياً داخل الروم رغم إرسال طلب الدخول.`);
+    }
+}
+
 async function connectWatcher(guild, channel) {
     if (!watcherClient || !watcherReady || !client.user) {
+        watcherInChannel = false;
         watcherWatching = false;
         return;
     }
 
     const wGuild = watcherClient.guilds.cache.get(guild.id);
     if (!wGuild) {
+        watcherInChannel = false;
         watcherWatching = false;
         addLog(`⚠️ حساب المشاهد غير موجود في السيرفر (${guild.id}).`);
         return;
@@ -109,13 +188,15 @@ async function connectWatcher(guild, channel) {
 
     const wChannel = wGuild.channels.cache.get(channel.id);
     if (!wChannel || (wChannel.type !== 'GUILD_VOICE' && wChannel.type !== 'GUILD_STAGE_VOICE')) {
+        watcherInChannel = false;
         watcherWatching = false;
         addLog(`⚠️ حساب المشاهد لا يمكنه الوصول للروم الصوتي (${channel.id}).`);
         return;
     }
 
     try {
-        destroyVoiceForClient(watcherClient, guild.id);
+        watcherInChannel = false;
+        watcherWatching = false;
 
         joinVoiceChannel({
             channelId: wChannel.id,
@@ -123,33 +204,17 @@ async function connectWatcher(guild, channel) {
             adapterCreator: wGuild.voiceAdapterCreator,
             selfMute: true,
             selfDeaf: true,
-            group: watcherClient.user.id
+            group: `watcher_${watcherClient.user.id}`
         });
 
-        addLog(`👀 دخل حساب المشاهد (${watcherUserTag}) إلى الروم: ${wChannel.name}`);
+        sendRawVoiceState(watcherClient, wGuild.id, wChannel.id, true, true);
+        addLog(`🔎 جاري التحقق من دخول حساب المشاهد (${watcherUserTag}) إلى الروم: ${wChannel.name}...`);
 
-        setTimeout(() => {
-            if (!config.enabled || !watcherReady || !client.user) return;
-            try {
-                const streamKey = `stream:${guild.id}:${channel.id}:${client.user.id}`;
-                watcherClient.ws.broadcast({
-                    op: 18,
-                    d: {
-                        type: 4,
-                        guild_id: guild.id,
-                        channel_id: channel.id,
-                        stream_key: streamKey,
-                        preferred_region: null
-                    }
-                });
-                watcherWatching = true;
-                addLog(`📡 أرسل حساب المشاهد إشارة متابعة البث (${streamKey})`);
-            } catch (err) {
-                watcherWatching = false;
-                addLog(`⚠️ تعذر إرسال إشارة المشاهدة: ${err.message}`);
-            }
-        }, 3500);
+        watcherVerifyTimer = setTimeout(() => {
+            verifyWatcherInChannel(wGuild, wChannel, 1);
+        }, 2500);
     } catch (err) {
+        watcherInChannel = false;
         watcherWatching = false;
         addLog(`⚠️ خطأ في دخول حساب المشاهد: ${err.message}`);
     }
@@ -194,10 +259,11 @@ async function applyVoiceState() {
             adapterCreator: guild.voiceAdapterCreator,
             selfMute: config.selfMute,
             selfDeaf: config.selfDeaf,
-            group: client.user.id
+            group: `main_${client.user.id}`
         });
 
-        addLog(`✅ تم الدخول إلى الروم: ${channel.name} (${guild.name})`);
+        sendRawVoiceState(client, guild.id, channel.id, config.selfMute, config.selfDeaf);
+        addLog(`✅ تم إرسال طلب دخول الحساب الأساسي إلى الروم: ${channel.name} (${guild.name})`);
 
         setTimeout(() => {
             if (!config.enabled || !mainReady) return;
@@ -265,16 +331,22 @@ if (watcherClient) {
 
     watcherClient.on('voiceStateUpdate', (oldState, newState) => {
         if (!watcherClient.user || oldState.member?.id !== watcherClient.user.id) return;
-        if (config.enabled && oldState.channelId && !newState.channelId) {
+
+        if (newState.channelId === config.channelId) {
+            watcherInChannel = true;
+        } else if (oldState.channelId === config.channelId && !newState.channelId) {
+            watcherInChannel = false;
             watcherWatching = false;
-            addLog('🔄 تم فصل حساب المشاهد من الروم، جاري إعادة دخوله خلال 5 ثوانٍ...');
-            setTimeout(() => {
-                const guild = client.guilds.cache.get(config.guildId);
-                const channel = guild?.channels.cache.get(config.channelId);
-                if (config.enabled && guild && channel) {
-                    connectWatcher(guild, channel);
-                }
-            }, 5000);
+            if (config.enabled) {
+                addLog('🔄 تم فصل حساب المشاهد من الروم، جاري إعادة التحقق والدخول خلال 5 ثوانٍ...');
+                setTimeout(() => {
+                    const guild = client.guilds.cache.get(config.guildId);
+                    const channel = guild?.channels.cache.get(config.channelId);
+                    if (config.enabled && guild && channel) {
+                        connectWatcher(guild, channel);
+                    }
+                }, 5000);
+            }
         }
     });
 }
@@ -288,6 +360,7 @@ app.get('/api/status', (req, res) => {
         hasWatcherToken,
         watcherReady,
         watcherUserTag,
+        watcherInChannel,
         watcherWatching,
         config,
         logs
@@ -343,6 +416,7 @@ app.get('/', (req, res) => {
   .badge { padding: 6px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; background: #0f172a; border: 1px solid #334155; }
   .ok { color: #4ade80; border-color: #166534; }
   .off { color: #f87171; border-color: #991b1b; }
+  .warn { color: #facc15; border-color: #854d0e; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
   label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }
@@ -364,7 +438,7 @@ app.get('/', (req, res) => {
 <div class="wrap">
   <div class="card">
     <h1>لوحة تحكم الروم والبث (AFK + Go Live + Watcher)</h1>
-    <div class="sub">تغيير الروم أو السيرفر، تشغيل أو إيقاف السكربت، ومراقبة حساب المشاهد الاختياري</div>
+    <div class="sub">تغيير الروم أو السيرفر، تشغيل أو إيقاف السكربت، والتحقق من دخول حساب المشاهد</div>
 
     <div class="status-bar">
       <div id="botBadge" class="badge">الحساب: ...</div>
@@ -433,12 +507,15 @@ async function refreshStatus(forceInputs = false) {
     if (!data.hasWatcherToken) {
       watcherBadge.textContent = 'المشاهد: غير مفعّل';
       watcherBadge.className = 'badge';
-    } else if (data.watcherReady) {
-      watcherBadge.textContent = 'المشاهد: ' + data.watcherUserTag + (data.watcherWatching ? ' (متابع)' : '');
-      watcherBadge.className = 'badge ok';
-    } else {
+    } else if (!data.watcherReady) {
       watcherBadge.textContent = 'المشاهد: جاري الاتصال...';
       watcherBadge.className = 'badge off';
+    } else if (data.watcherInChannel) {
+      watcherBadge.textContent = 'المشاهد: ' + data.watcherUserTag + ' (داخل الروم' + (data.watcherWatching ? ' / متابع' : '') + ')';
+      watcherBadge.className = 'badge ok';
+    } else {
+      watcherBadge.textContent = 'المشاهد: ' + data.watcherUserTag + ' (غير مؤكد بالروم)';
+      watcherBadge.className = 'badge warn';
     }
 
     const toggleBtn = document.getElementById('toggleBtn');
